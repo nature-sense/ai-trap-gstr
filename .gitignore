@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  .gitignore — IntelliJ + Meson/Ninja C++ project
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Meson build directories ───────────────────────────────────────────────────
+buildDir/
+build-*/
+_build/
+.mesonpy/
+meson-logs/
+meson-info/
+meson-private/
+# Compiled outputs that may end up in the source tree
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# ── Binaries ──────────────────────────────────────────────────────────────────
+yolo_libcamera
+yolo_v4l2
+
+# ── Runtime outputs (generated at runtime, not source) ────────────────────────
+detections.db
+detections.db-shm
+detections.db-wal
+crops/
+*.jpg
+*.jpeg
+*.png
+
+# ── IntelliJ IDEA / CLion ─────────────────────────────────────────────────────
+.idea/
+*.iml
+*.iws
+*.ipr
+cmake-build-*/
+# CLion Meson integration workspace files
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries/
+.idea/shelf/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor scratch ────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+\#*\#
