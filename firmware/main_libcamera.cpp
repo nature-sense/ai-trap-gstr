@@ -51,6 +51,7 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
+    std::signal(SIGPIPE, SIG_IGN);  // prevent exit on client disconnect
 
     // ── Load configuration ────────────────────────────────────────────────────
 
