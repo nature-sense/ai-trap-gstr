@@ -126,6 +126,9 @@ public:
     // Number of records currently queued for writing.
     size_t pendingWrites() const { return m_pending.load(); }
 
+    // Raw sqlite3 handle — use with care.
+    sqlite3* rawDb() const { return m_db; }
+
     // Called on background write errors (optional).
     using ErrorCallback = std::function<void(const std::string& msg)>;
     void setErrorCallback(ErrorCallback cb) { m_errorCb = std::move(cb); }

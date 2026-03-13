@@ -31,12 +31,25 @@ enum class YoloFormat { Auto, AnchorGrid, EndToEnd };
 //  DecoderConfig
 // ─────────────────────────────────────────────────────────────────────────────
 struct DecoderConfig {
-    float      confThresh  = 0.45f;            // minimum score to keep
-    float      nmsThresh   = 0.45f;            // IoU threshold for NMS (Format A only)
-    int        numClasses  = 80;               // set to match your model
-    int        modelWidth  = 640;              // must match the ncnn export imgsz
-    int        modelHeight = 640;
-    YoloFormat format      = YoloFormat::Auto; // override auto-detection if needed
+    float      confThresh    = 0.45f;            // minimum score to keep
+    float      nmsThresh     = 0.45f;            // IoU threshold for NMS (Format A only)
+    int        numClasses    = 80;               // set to match your model
+    int        modelWidth    = 640;              // must match the ncnn export imgsz
+    int        modelHeight   = 640;
+    YoloFormat format        = YoloFormat::Auto; // override auto-detection if needed
+
+    // Set true when the model already applies sigmoid to class scores internally
+    // (i.e. a Sigmoid layer appears before the final output concat in the .param).
+    // Prevents the decoder from applying sigmoid a second time (double-sigmoid
+    // compresses all scores toward 0.5 and masks real confidence levels).
+    bool preAppliedSigmoid  = false;
+
+    // ── Box sanity filters (applied in original image pixel space) ────────────
+    // Detections failing any filter are dropped silently before NMS.
+    float minBoxWidth    = 20.f;   // pixels — reject tiny slivers
+    float minBoxHeight   = 20.f;
+    float maxAspectRatio =  5.f;   // max(w/h, h/w) — insects are not needles
+    float maxBoxAreaRatio = 0.15f; // box_area / frame_area — reject region-sized detections
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

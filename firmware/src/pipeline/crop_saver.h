@@ -1,4 +1,6 @@
 #pragma once
+#include <functional>
+#include "exif_writer.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -23,11 +25,17 @@ struct CropSaverConfig {
 
     // Minimum confidence required before a crop is even considered.
     // Tracks below this threshold are silently ignored even if confirmed.
-    float minConfidence     = 0.50f;
+    float minConfidence      = 0.50f;
+    float minConfidenceDelta = 0.05f;  // must beat previous best by this much
+    int   maxSavesPerTrack   = 3;      // stop saving after this many — idle insects
 
     // Maximum depth of the async write queue.  If the worker falls behind
     // this many jobs are held in memory; additional submits are dropped.
     int maxQueueDepth       = 16;
+
+    // EXIF injection — populated from TrapConfig at startup
+    bool                 exifEnabled  = true;
+    ExifWriter::Params   exifTemplate; // trapId, trapLocation, hasGps, lat, lon, alt
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +87,13 @@ public:
     // Throws std::runtime_error if the directory cannot be created.
     void open(const CropSaverConfig& cfg);
 
+    // Optional callback — fired on the worker thread after each JPEG is written.
+    // Arguments: trackId, classId, className, confidence, filepath, w, h
+    using SavedCallback = std::function<void(
+        int trackId, int classId, const std::string& cls,
+        float conf, const std::string& path, int w, int h)>;
+    void setSavedCallback(SavedCallback cb) { m_savedCb = std::move(cb); }
+
     // Submit a detection for possible saving.
     // nv12      : compact (de-strided) NV12 buffer, frameWidth * frameHeight * 3/2 bytes
     // frameW/H  : original capture dimensions
@@ -94,7 +109,8 @@ public:
                 int trackId, int classId,
                 const std::string& className,
                 float confidence,
-                float x1, float y1, float x2, float y2);
+                float x1, float y1, float x2, float y2,
+                int64_t timestampUs = 0);
 
     // Block until the write queue is empty.
     void flush();
@@ -111,16 +127,18 @@ private:
     // ── Per-track best-confidence record ──────────────────────────────────────
     struct TrackRecord {
         float       bestConfidence = -1.f;
+        int         saveCount      = 0;
         std::string lastPath;
     };
 
     // ── Async job ─────────────────────────────────────────────────────────────
     struct CropJob {
         std::vector<uint8_t> nv12;   // full-frame NV12, compact
-        int   frameW, frameH;
-        int   trackId, classId;
+        int     frameW, frameH;
+        int     trackId, classId;
         std::string className;
-        float confidence;
+        float   confidence;
+        int64_t timestampUs = 0;   // frame capture time (µs since epoch)
         // Pixel-aligned crop box (even coordinates)
         int   cropX, cropY, cropW, cropH;
         std::string outPath;
@@ -145,6 +163,7 @@ private:
     std::atomic<uint64_t> m_cropsSaved{0};
     std::atomic<uint64_t> m_cropsDropped{0};
 
+    SavedCallback m_savedCb;
     void workerLoop();
 
     // Extract an NV12 crop and encode to JPEG file.

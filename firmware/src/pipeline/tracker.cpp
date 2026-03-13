@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_set>
+#include <cstdio>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KalmanTrack — helpers
@@ -170,25 +172,25 @@ std::vector<TrackedObject> ByteTracker::update(
     auto matches2 = matchGreedy(unmatchedTracks, lowDets,
                                 m_cfg.iouThresh * 0.8f);
 
-    // Build a set of track pointers updated in pass 2
+    // Use a pointer set — unmatchedTracks indices != activeTracks indices
+    std::unordered_set<KalmanTrack*> matchedPtrs;
+    for (const auto& m : matches1)
+        matchedPtrs.insert(activeTracks[m.trackIdx]);
     for (const auto& m : matches2) {
-        unmatchedTracks[m.trackIdx]->update(
+        KalmanTrack* trk = unmatchedTracks[m.trackIdx];
+        trk->update(
             lowDets[m.detIdx].x1, lowDets[m.detIdx].y1,
             lowDets[m.detIdx].x2, lowDets[m.detIdx].y2,
             lowDets[m.detIdx].confidence);
-        // Mark as matched so we don't mark it lost below
-        trackMatched[m.trackIdx] = true;   // index relative to activeTracks
+        matchedPtrs.insert(trk);
     }
-    // Note: unmatchedTracks indices don't directly correspond to trackMatched
-    // indices, so we use the pointer set approach above and re-check below.
 
-    // ── Step 5: tracks with no match in either pass lose a hit streak ─────────
-    // (missedFrames was already incremented by predict(); hitStreak degrades)
+    // ── Step 5: tracks with no match in either pass lose hit streak ───────────
     for (auto& t : m_tracks) {
-        // hitStreak drops on a miss (already handled: we only call update on matches)
-        // Just ensure hitStreak doesn't go below 0
-        if (t.hitStreak > 0 && t.missedFrames > 0)
+        if (matchedPtrs.find(&t) == matchedPtrs.end()) {
+            // Genuinely unmatched this frame
             t.hitStreak = std::max(0, t.hitStreak - 1);
+        }
     }
 
     // ── Step 6: create new tracks from unmatched HIGH-confidence dets ─────────
@@ -219,9 +221,18 @@ std::vector<TrackedObject> ByteTracker::update(
     out.reserve(m_tracks.size());
 
     for (auto& t : m_tracks) {
-        if (t.hitStreak >= m_cfg.minHits)
-            t.confirmed = true;
+        // confirmed tracks hitStreak >= minHits; lost tracks become unconfirmed
+        t.confirmed = (t.hitStreak >= m_cfg.minHits);
         out.push_back(t.toOutput());
+    }
+
+    // ── Debug: print tracker state every 900 frames (~30 s at 30 fps) ──────────
+    {
+        static int dbgFrame = 0;
+        if (++dbgFrame % 900 == 0) {
+            printf("[tracker] frame=%d  active_tracks=%zu\n",
+                   dbgFrame, m_tracks.size());
+        }
     }
 
     return out;

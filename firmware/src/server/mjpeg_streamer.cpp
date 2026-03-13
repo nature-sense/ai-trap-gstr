@@ -3,7 +3,7 @@
 // stb_image_write — implementation compiled in stb_image_write_impl.cpp
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-#include "stb_image_write.h"
+#include "../common/stb_image_write.h"
 #pragma GCC diagnostic pop
 
 // ncnn NV12→RGB: BT.601 limited-range, NEON-optimised on ARM.

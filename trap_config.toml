@@ -1,0 +1,130 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  trap_config.toml  —  AI Trap runtime configuration
+#  Copy to the build directory and edit as needed.
+#  Unset keys fall back to the built-in defaults shown here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[trap]
+id       = "trap_001"
+location = ""
+# GPS coordinates (decimal degrees).  Set once via POST /api/config/location
+# or hard-code here.  lat/lon also enable EXIF geo-tagging in saved crops.
+# lat    = 51.5074
+# lon    = -0.1278
+# alt_m  = 0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[model]
+param       = "../firmware/models/yolo11n-320/model.ncnn.param"
+bin         = "../firmware/models/yolo11n-320/model.ncnn.bin"
+width       = 320           # must match the ncnn export imgsz
+height      = 320
+num_classes = 1             # 1 for single-class insect model
+format               = "anchor_grid" # yolo11n default ncnn export
+pre_applied_sigmoid  = true          # model has sigmoid before output — skip decoder sigmoid
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[detection]
+conf_threshold    = 0.45    # minimum score to keep a detection
+nms_threshold     = 0.45    # IoU threshold for NMS (anchor_grid format only)
+min_box_width     = 20      # pixels — reject tiny slivers
+min_box_height    = 20
+max_aspect_ratio  = 5.0     # max(w/h, h/w) — insects are not needles
+max_box_area_ratio = 0.15   # box_area / frame_area — reject region-sized blobs
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tracker]
+high_threshold = 0.50       # detections above this join pass-1 matching
+low_threshold  = 0.20       # detections above this join pass-2 matching
+iou_threshold  = 0.30       # IoU gate for track/detection matching
+min_hits       = 3          # frames before a track is "confirmed"
+max_missed     = 30         # frames before a lost track is deleted
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[camera]
+# camera_id     = ""        # empty = first camera found
+# tuning_file   = ""        # empty = IPA default
+#                           # IMX708:      /usr/share/libcamera/ipa/rpi/pisp/imx708.json
+#                           # IMX708 Wide: /usr/share/libcamera/ipa/rpi/pisp/imx708_wide.json
+#                           # IMX477:      /usr/share/libcamera/ipa/rpi/pisp/imx477.json
+
+# IMX708 recommended mode — 2x2 binned, full FOV
+capture_width  = 2304
+capture_height = 1296
+framerate      = 30
+buffer_count   = 4
+
+brightness  =  0.0          # −1.0 .. +1.0
+contrast    =  1.0          #  0.0 ..  4.0
+saturation  =  1.0          #  0.0 ..  4.0
+sharpness   =  1.0          #  0.0 .. 16.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[autofocus]
+# AfMode:
+#   0 = Manual      — lens held at lens_position, no scanning
+#   1 = Auto        — single scan triggered at start(), then holds
+#   2 = Continuous  — IPA continuously re-focuses (default)
+mode  = 2
+
+# AfRange (Auto and Continuous modes only):
+#   0 = Normal  — ~10 cm to infinity  (recommended for insect traps)
+#   1 = Macro   — optimised for < 10 cm
+#   2 = Full    — entire VCM range (slowest)
+range = 0
+
+# AfSpeed:
+#   0 = Normal  — smooth, less hunting (recommended)
+#   1 = Fast    — aggressive, may hunt on uniform surfaces
+speed = 0
+
+# LensPosition in dioptres — Manual mode only.
+#   0.0 = infinity,  1.0 = 1 m,  2.0 = 0.5 m,  4.0 = 0.25 m
+lens_position = 2.0
+
+# AF metering window in sensor pixels [x, y, w, h].
+# All zero = full-frame metering (default).
+window_x = 0
+window_y = 0
+window_w = 0
+window_h = 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[crops]
+output_dir           = "crops"
+jpeg_quality         = 90       # 1–100
+min_confidence       = 0.50     # ignore tracks below this threshold
+min_confidence_delta = 0.05     # must beat previous best by this much to re-save
+max_saves_per_track  = 3        # stop saving after this many frames per track
+max_queue_depth      = 16       # async write queue depth (extra submits dropped)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[stream]
+port         = 9000
+width        = 640
+height       = 480
+jpeg_quality = 75               # lower = less CPU on the Pi
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[sse]
+port            = 8081
+max_clients     = 8
+max_queue_depth = 64
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[api]
+port = 8080
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[database]
+path = "detections.db"

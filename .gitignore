@@ -1,55 +1,14 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  .gitignore — IntelliJ + Meson/Ninja C++ project
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Meson build directories ───────────────────────────────────────────────────
-buildDir/
+# Build directories
+build/
 build-*/
-_build/
-.mesonpy/
-meson-logs/
-meson-info/
-meson-private/
-# Compiled outputs that may end up in the source tree
-*.o
-*.a
-*.so
-*.so.*
-*.dylib
 
-# ── Binaries ──────────────────────────────────────────────────────────────────
-yolo_libcamera
-yolo_v4l2
+# Model weights — .param and .bin are small enough to commit.
+# .rknn files are larger compiled outputs — regenerate from .onnx.
+models/*.rknn
+models/*.onnx
 
-# ── Runtime outputs (generated at runtime, not source) ────────────────────────
-detections.db
-detections.db-shm
-detections.db-wal
+# Runtime outputs
 crops/
-*.jpg
-*.jpeg
-*.png
-
-# ── IntelliJ IDEA / CLion ─────────────────────────────────────────────────────
-.idea/
-*.iml
-*.iws
-*.ipr
-cmake-build-*/
-# CLion Meson integration workspace files
-.idea/workspace.xml
-.idea/tasks.xml
-.idea/usage.statistics.xml
-.idea/dictionaries/
-.idea/shelf/
-
-# ── OS ────────────────────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ── Editor scratch ────────────────────────────────────────────────────────────
-*.swp
-*.swo
-*~
-\#*\#
+*.db
+*.db-wal
+*.db-shm

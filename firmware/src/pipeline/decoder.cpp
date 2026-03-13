@@ -172,7 +172,9 @@ std::vector<Detection> YoloDecoder::decodeAnchorGrid(
         float bestScore = m_cfg.confThresh;
         int   bestCls   = -1;
         for (int c = 0; c < numClasses; c++) {
-            float s = sigmoid(out.row(4 + c)[i]);
+            float s = m_cfg.preAppliedSigmoid
+                      ? out.row(4 + c)[i]
+                      : sigmoid(out.row(4 + c)[i]);
             if (s > bestScore) { bestScore = s; bestCls = c; }
         }
         if (bestCls < 0) continue;
@@ -188,6 +190,17 @@ std::vector<Detection> YoloDecoder::decodeAnchorGrid(
         float y2 = clampf(unpad(cy + bh * 0.5f, padTop,  scale), 0.f, (float)srcH);
 
         if (x2 - x1 < 1.f || y2 - y1 < 1.f) continue;
+
+        // ── Box sanity filters ────────────────────────────────────────────────
+        {
+            float w = x2 - x1, h = y2 - y1;
+            if (w < m_cfg.minBoxWidth)  continue;
+            if (h < m_cfg.minBoxHeight) continue;
+            float ar = (w > h) ? (w / h) : (h / w);
+            if (ar > m_cfg.maxAspectRatio) continue;
+            float frameArea = static_cast<float>(srcW) * static_cast<float>(srcH);
+            if ((w * h) / frameArea > m_cfg.maxBoxAreaRatio) continue;
+        }
 
         dets.push_back({ x1, y1, x2, y2, bestScore, bestCls });
     }
@@ -248,6 +261,17 @@ std::vector<Detection> YoloDecoder::decodeEndToEnd(
         float oy2 = clampf(unpad(y2, padTop,  scale), 0.f, (float)srcH);
 
         if (ox2 - ox1 < 1.f || oy2 - oy1 < 1.f) continue;
+
+        // ── Box sanity filters ────────────────────────────────────────────────
+        {
+            float w = ox2 - ox1, h = oy2 - oy1;
+            if (w < m_cfg.minBoxWidth)  continue;
+            if (h < m_cfg.minBoxHeight) continue;
+            float ar = (w > h) ? (w / h) : (h / w);
+            if (ar > m_cfg.maxAspectRatio) continue;
+            float frameArea = static_cast<float>(srcW) * static_cast<float>(srcH);
+            if ((w * h) / frameArea > m_cfg.maxBoxAreaRatio) continue;
+        }
 
         result.push_back({ ox1, oy1, ox2, oy2, conf, cls });
     }

@@ -18,11 +18,14 @@
 #include "tracker.h"
 #include "crop_saver.h"
 #include "mjpeg_streamer.h"
+#include "sse_server.h"
+#include "http_server.h"
 
+#include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <cctype>
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TrapConfig  — all runtime-configurable parameters in one place
@@ -32,6 +35,10 @@ struct TrapConfig {
     // [trap]
     std::string trapId       = "trap_001";
     std::string trapLocation = "";
+    double      gpsLat       = 0.0;    // decimal degrees (negative = South)
+    double      gpsLon       = 0.0;    // decimal degrees (negative = West)
+    double      gpsAltM      = 0.0;    // metres above sea level
+    bool        gpsValid     = false;  // true once lat/lon have been set
 
     // [model]
     std::string modelParam   = "yolo11n.param";
@@ -41,11 +48,13 @@ struct TrapConfig {
     std::string dbPath       = "detections.db";
 
     // Component configs — populated by loadConfig()
-    DecoderConfig      decoder;
-    ByteTrackerConfig  tracker;
-    LibcameraConfig    camera;
-    CropSaverConfig    crops;
+    DecoderConfig       decoder;
+    ByteTrackerConfig   tracker;
+    LibcameraConfig     camera;
+    CropSaverConfig     crops;
     MjpegStreamerConfig stream;
+    SseConfig           sse;
+    HttpServerConfig    http;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +63,6 @@ struct TrapConfig {
 
 namespace detail {
 
-// Trim leading and trailing whitespace in-place
 static std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
@@ -62,7 +70,6 @@ static std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
-// Strip inline comment (everything from '#' onwards, outside quotes)
 static std::string stripComment(const std::string& s) {
     bool inStr = false;
     for (size_t i = 0; i < s.size(); i++) {
@@ -72,24 +79,19 @@ static std::string stripComment(const std::string& s) {
     return s;
 }
 
-// Remove surrounding double-quotes from a string value
 static std::string unquote(const std::string& s) {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
         return s.substr(1, s.size() - 2);
     return s;
 }
 
-static float   toFloat(const std::string& s) { return std::stof(s); }
-static int     toInt  (const std::string& s) { return std::stoi(s); }
-static bool    toBool (const std::string& s) { return s == "true" || s == "1"; }
+static float toFloat(const std::string& s) { return std::stof(s); }
+static int   toInt  (const std::string& s) { return std::stoi(s); }
 
 } // namespace detail
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  loadConfig  — parse trap_config.toml into TrapConfig
-//
-//  Returns true on success.  Prints warnings for unrecognised keys.
-//  Missing keys retain their default values from TrapConfig initialisation.
+//  loadConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
 static bool loadConfig(const char* path, TrapConfig& cfg) {
@@ -109,55 +111,64 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
         std::string line = detail::trim(detail::stripComment(lineBuf));
         if (line.empty()) continue;
 
-        // ── Section header ────────────────────────────────────────────────────
         if (line.front() == '[') {
             size_t close = line.find(']');
             if (close == std::string::npos) {
-                fprintf(stderr, "loadConfig:%d: malformed section header\n", lineNo);
+                fprintf(stderr, "loadConfig:%d: malformed section\n", lineNo);
                 continue;
             }
             section = detail::trim(line.substr(1, close - 1));
             continue;
         }
 
-        // ── Key = value ───────────────────────────────────────────────────────
         size_t eq = line.find('=');
-        if (eq == std::string::npos) {
-            fprintf(stderr, "loadConfig:%d: no '=' found, skipping\n", lineNo);
-            continue;
-        }
+        if (eq == std::string::npos) continue;
+
         std::string key = detail::trim(line.substr(0, eq));
         std::string val = detail::trim(detail::unquote(detail::trim(line.substr(eq + 1))));
 
-        // ── Dispatch to struct fields ─────────────────────────────────────────
         try {
             if (section == "trap") {
-                if      (key == "id")           cfg.trapId       = val;
-                else if (key == "location")     cfg.trapLocation = val;
+                if      (key == "id")       cfg.trapId       = val;
+                else if (key == "location") cfg.trapLocation = val;
+                else if (key == "lat") {
+                    cfg.gpsLat   = std::stod(val);
+                    cfg.gpsValid = true;
+                }
+                else if (key == "lon") {
+                    cfg.gpsLon   = std::stod(val);
+                    cfg.gpsValid = true;
+                }
+                else if (key == "alt_m")  cfg.gpsAltM = std::stod(val);
 
             } else if (section == "model") {
-                if      (key == "param")        cfg.modelParam               = val;
-                else if (key == "bin")          cfg.modelBin                 = val;
-                else if (key == "width")        cfg.decoder.modelWidth       = detail::toInt(val);
-                else if (key == "height")       cfg.decoder.modelHeight      = detail::toInt(val);
-                else if (key == "num_classes")  cfg.decoder.numClasses       = detail::toInt(val);
-                else if (key == "threads")      { /* stored separately — see loadConfig return */ }
+                if      (key == "param")       cfg.modelParam          = val;
+                else if (key == "bin")         cfg.modelBin            = val;
+                else if (key == "width")       cfg.decoder.modelWidth  = detail::toInt(val);
+                else if (key == "height")      cfg.decoder.modelHeight = detail::toInt(val);
+                else if (key == "num_classes") cfg.decoder.numClasses  = detail::toInt(val);
                 else if (key == "format") {
                     if      (val == "anchor_grid") cfg.decoder.format = YoloFormat::AnchorGrid;
                     else if (val == "end_to_end")  cfg.decoder.format = YoloFormat::EndToEnd;
                     else                           cfg.decoder.format = YoloFormat::Auto;
                 }
+                else if (key == "pre_applied_sigmoid")
+                    cfg.decoder.preAppliedSigmoid = (val == "true" || val == "1");
 
             } else if (section == "detection") {
                 if      (key == "conf_threshold") cfg.decoder.confThresh = detail::toFloat(val);
                 else if (key == "nms_threshold")  cfg.decoder.nmsThresh  = detail::toFloat(val);
+                else if (key == "min_box_width")    cfg.decoder.minBoxWidth    = detail::toFloat(val);
+                else if (key == "min_box_height")   cfg.decoder.minBoxHeight   = detail::toFloat(val);
+                else if (key == "max_aspect_ratio")  cfg.decoder.maxAspectRatio  = detail::toFloat(val);
+                else if (key == "max_box_area_ratio") cfg.decoder.maxBoxAreaRatio = detail::toFloat(val);
 
             } else if (section == "tracker") {
-                if      (key == "high_threshold") cfg.tracker.highThresh  = detail::toFloat(val);
-                else if (key == "low_threshold")  cfg.tracker.lowThresh   = detail::toFloat(val);
-                else if (key == "iou_threshold")  cfg.tracker.iouThresh   = detail::toFloat(val);
-                else if (key == "min_hits")        cfg.tracker.minHits     = detail::toInt(val);
-                else if (key == "max_missed")      cfg.tracker.maxMissed   = detail::toInt(val);
+                if      (key == "high_threshold") cfg.tracker.highThresh = detail::toFloat(val);
+                else if (key == "low_threshold")  cfg.tracker.lowThresh  = detail::toFloat(val);
+                else if (key == "iou_threshold")  cfg.tracker.iouThresh  = detail::toFloat(val);
+                else if (key == "min_hits")        cfg.tracker.minHits    = detail::toInt(val);
+                else if (key == "max_missed")      cfg.tracker.maxMissed  = detail::toInt(val);
 
             } else if (section == "camera") {
                 if      (key == "camera_id")      cfg.camera.cameraId      = val;
@@ -172,51 +183,63 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
                 else if (key == "sharpness")      cfg.camera.sharpness     = detail::toFloat(val);
 
             } else if (section == "autofocus") {
-                if      (key == "mode")           cfg.camera.afMode        = detail::toInt(val);
-                else if (key == "range")          cfg.camera.afRange       = detail::toInt(val);
-                else if (key == "speed")          cfg.camera.afSpeed       = detail::toInt(val);
-                else if (key == "lens_position")  cfg.camera.lensPosition  = detail::toFloat(val);
-                else if (key == "window_x")       cfg.camera.afWindowX     = detail::toInt(val);
-                else if (key == "window_y")       cfg.camera.afWindowY     = detail::toInt(val);
-                else if (key == "window_w")       cfg.camera.afWindowW     = detail::toInt(val);
-                else if (key == "window_h")       cfg.camera.afWindowH     = detail::toInt(val);
+                if      (key == "mode")           cfg.camera.afMode       = detail::toInt(val);
+                else if (key == "range")          cfg.camera.afRange      = detail::toInt(val);
+                else if (key == "speed")          cfg.camera.afSpeed      = detail::toInt(val);
+                else if (key == "lens_position")  cfg.camera.lensPosition = detail::toFloat(val);
+                else if (key == "window_x")       cfg.camera.afWindowX    = detail::toInt(val);
+                else if (key == "window_y")       cfg.camera.afWindowY    = detail::toInt(val);
+                else if (key == "window_w")       cfg.camera.afWindowW    = detail::toInt(val);
+                else if (key == "window_h")       cfg.camera.afWindowH    = detail::toInt(val);
 
             } else if (section == "crops") {
-                if      (key == "output_dir")     cfg.crops.outputDir      = val;
-                else if (key == "jpeg_quality")   cfg.crops.jpegQuality    = detail::toInt(val);
-                else if (key == "min_confidence") cfg.crops.minConfidence  = detail::toFloat(val);
-                else if (key == "max_queue_depth")cfg.crops.maxQueueDepth  = detail::toInt(val);
+                if      (key == "output_dir")      cfg.crops.outputDir      = val;
+                else if (key == "jpeg_quality")    cfg.crops.jpegQuality    = detail::toInt(val);
+                else if (key == "min_confidence")  cfg.crops.minConfidence  = detail::toFloat(val);
+                else if (key == "min_confidence_delta") cfg.crops.minConfidenceDelta = detail::toFloat(val);
+                else if (key == "max_saves_per_track")  cfg.crops.maxSavesPerTrack  = detail::toInt(val);
+                else if (key == "max_queue_depth")      cfg.crops.maxQueueDepth     = detail::toInt(val);
 
             } else if (section == "stream") {
-                if      (key == "port")           cfg.stream.port          = detail::toInt(val);
-                else if (key == "width")          cfg.stream.streamWidth   = detail::toInt(val);
-                else if (key == "height")         cfg.stream.streamHeight  = detail::toInt(val);
-                else if (key == "jpeg_quality")   cfg.stream.jpegQuality   = detail::toInt(val);
+                if      (key == "port")         cfg.stream.port          = detail::toInt(val);
+                else if (key == "width")        cfg.stream.streamWidth   = detail::toInt(val);
+                else if (key == "height")       cfg.stream.streamHeight  = detail::toInt(val);
+                else if (key == "jpeg_quality") cfg.stream.jpegQuality   = detail::toInt(val);
+
+            } else if (section == "sse") {
+                if      (key == "port")            cfg.sse.port           = detail::toInt(val);
+                else if (key == "max_clients")     cfg.sse.maxClients     = detail::toInt(val);
+                else if (key == "max_queue_depth") cfg.sse.maxQueueDepth  = detail::toInt(val);
+
+            } else if (section == "api") {
+                if (key == "port") cfg.http.port = detail::toInt(val);
 
             } else if (section == "database") {
-                if      (key == "path")           cfg.dbPath               = val;
-
-            } else {
-                fprintf(stderr, "loadConfig:%d: unknown section [%s]\n",
-                        lineNo, section.c_str());
+                if (key == "path") cfg.dbPath = val;
             }
+
         } catch (const std::exception& e) {
-            fprintf(stderr, "loadConfig:%d: error parsing [%s] %s = \"%s\": %s\n",
+            fprintf(stderr, "loadConfig:%d: [%s] %s = \"%s\": %s\n",
                     lineNo, section.c_str(), key.c_str(), val.c_str(), e.what());
         }
     }
 
     fclose(f);
 
-    // model width/height must be mirrored into camera config for preprocessing
+    // Mirror model size into camera config (used by preprocess())
     cfg.camera.modelWidth  = cfg.decoder.modelWidth;
     cfg.camera.modelHeight = cfg.decoder.modelHeight;
+
+    // Mirror trap identity into HttpServerConfig
+    cfg.http.cropsDir     = cfg.crops.outputDir;
+    cfg.http.trapId       = cfg.trapId;
+    cfg.http.trapLocation = cfg.trapLocation;
 
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  printConfig  — log the active configuration at startup
+//  printConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void printConfig(const TrapConfig& cfg) {
@@ -237,18 +260,20 @@ static void printConfig(const TrapConfig& cfg) {
     printf("│  AF mode       %d  range=%d  speed=%d  lens=%.1f D\n",
            cfg.camera.afMode, cfg.camera.afRange,
            cfg.camera.afSpeed, cfg.camera.lensPosition);
-    printf("│  Tracker       high=%.2f  low=%.2f  iou=%.2f  "
-           "hits=%d  missed=%d\n",
+    printf("│  Tracker       high=%.2f  low=%.2f  iou=%.2f  hits=%d  missed=%d\n",
            cfg.tracker.highThresh, cfg.tracker.lowThresh,
            cfg.tracker.iouThresh, cfg.tracker.minHits, cfg.tracker.maxMissed);
     printf("│  Crops         %s  q=%d  min_conf=%.2f\n",
            cfg.crops.outputDir.c_str(),
            cfg.crops.jpegQuality,
            cfg.crops.minConfidence);
-    printf("│  Stream        port=%d  %dx%d  q=%d\n",
+    printf("│  Stream (MJPEG)port=%d  %dx%d  q=%d\n",
            cfg.stream.port,
            cfg.stream.streamWidth, cfg.stream.streamHeight,
            cfg.stream.jpegQuality);
+    printf("│  SSE           port=%d  max_clients=%d\n",
+           cfg.sse.port, cfg.sse.maxClients);
+    printf("│  API           port=%d\n", cfg.http.port);
     printf("│  Database      %s\n", cfg.dbPath.c_str());
     printf("└───────────────────────────────────────────────────────────\n\n");
 }

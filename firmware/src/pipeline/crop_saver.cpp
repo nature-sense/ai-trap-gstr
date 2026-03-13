@@ -66,7 +66,8 @@ bool CropSaver::submit(const std::vector<uint8_t>& nv12,
                        int trackId, int classId,
                        const std::string& className,
                        float confidence,
-                       float x1, float y1, float x2, float y2)
+                       float x1, float y1, float x2, float y2,
+                       int64_t timestampUs)
 {
     // ── 1. Fast-path confidence gate ──────────────────────────────────────────
     if (confidence < m_cfg.minConfidence)
@@ -77,8 +78,14 @@ bool CropSaver::submit(const std::vector<uint8_t>& nv12,
     {
         std::lock_guard<std::mutex> lk(m_trackMutex);
         auto& rec = m_tracks[trackId];
-        if (confidence <= rec.bestConfidence)
-            return false;   // not a new best — skip
+
+        // Stop saving once we have enough crops for this track
+        if (rec.saveCount >= m_cfg.maxSavesPerTrack)
+            return false;
+
+        // Must beat previous best by at least minConfidenceDelta
+        if (confidence < rec.bestConfidence + m_cfg.minConfidenceDelta)
+            return false;
 
         rec.bestConfidence = confidence;
         // Fixed filename per track — overwrites previous best on disk
@@ -113,7 +120,8 @@ bool CropSaver::submit(const std::vector<uint8_t>& nv12,
         job.trackId    = trackId;
         job.classId    = classId;
         job.className  = className;
-        job.confidence = confidence;
+        job.confidence  = confidence;
+        job.timestampUs = timestampUs;
         job.cropX      = cx1;
         job.cropY      = cy1;
         job.cropW      = cw;
@@ -166,10 +174,30 @@ void CropSaver::workerLoop() {
             m_queue.pop();
         }
 
-        if (writeCrop(job))
+        if (writeCrop(job)) {
             m_cropsSaved++;
-        else
+            {
+                std::lock_guard<std::mutex> lk(m_trackMutex);
+                m_tracks[job.trackId].saveCount++;
+            }
+            // ── EXIF injection ────────────────────────────────────────────────
+            if (m_cfg.exifEnabled) {
+                ExifWriter::Params ep = m_cfg.exifTemplate;
+                ep.trackId     = job.trackId;
+                ep.classId     = job.classId;
+                ep.className   = job.className;
+                ep.confidence  = job.confidence;
+                ep.timestampUs = job.timestampUs;
+                ExifWriter::inject(job.outPath, ep);
+            }
+            if (m_savedCb) {
+                m_savedCb(job.trackId, job.classId, job.className,
+                          job.confidence, job.outPath,
+                          job.cropW, job.cropH);
+            }
+        } else {
             m_cropsDropped++;
+        }
 
         m_pending--;
     }
