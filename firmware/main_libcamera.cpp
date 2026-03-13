@@ -33,7 +33,8 @@ static const char* className(int id) { return id == 0 ? CLASS_NAMES[0] : "?"; }
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::atomic<bool> g_stop{false};
-static void onSignal(int) { g_stop = true; }
+static std::atomic<int>  g_stopSignal{0};
+static void onSignal(int sig) { g_stopSignal = sig; g_stop = true; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  main
@@ -401,7 +402,11 @@ int main(int argc, char* argv[]) {
 
     // ── Shutdown ──────────────────────────────────────────────────────────────
 
-    printf("\nShutting down...\n");
+    int sig = g_stopSignal.load();
+    if (sig)
+        printf("\nCaught signal %d (%s) — shutting down...\n", sig, strsignal(sig));
+    else
+        printf("\nCamera stopped unexpectedly — shutting down...\n");
     cam.stop();
     http.close();
     sse.close();
