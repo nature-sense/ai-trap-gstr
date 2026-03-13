@@ -21,6 +21,9 @@
 //
 //  health      — system health (every 30 s alongside stats)
 //    {"type":"health","temp_c":42.1,"af_state":2,"lens_pos":2.4}
+//
+//  capture     — fired when detection is started or stopped via REST
+//    {"type":"capture","active":true,"ts":1741234567890}
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <chrono>
@@ -123,6 +126,20 @@ static inline std::string health(
         "\"lens_pos\":%.2f,"
         "\"ts\":%lld}",
         tempC, afState, lensPos,
+        nowMs());
+    return buf;
+}
+
+// ── capture ───────────────────────────────────────────────────────────────────
+
+static inline std::string captureState(bool active)
+{
+    char buf[80];
+    snprintf(buf, sizeof(buf),
+        "{\"type\":\"capture\","
+        "\"active\":%s,"
+        "\"ts\":%lld}",
+        active ? "true" : "false",
         nowMs());
     return buf;
 }

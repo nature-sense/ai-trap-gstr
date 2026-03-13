@@ -135,15 +135,17 @@ std::string HttpServer::syncManifestJson(const SyncSession& sess) const
 // ─────────────────────────────────────────────────────────────────────────────
 
 void HttpServer::open(const HttpServerConfig& cfg,
-                      SqliteWriter* db,
-                      SseServer*    sse,
-                      SyncManager*  sync,
-                      const float*  fps)
+                      SqliteWriter*      db,
+                      SseServer*         sse,
+                      SyncManager*       sync,
+                      const float*       fps,
+                      const std::atomic<bool>* capturing)
 {
-    m_cfg  = cfg;
-    m_db   = db;
-    m_sse  = sse;
-    m_fps  = fps;
+    m_cfg       = cfg;
+    m_db        = db;
+    m_sse       = sse;
+    m_fps       = fps;
+    m_capturing = capturing;
     m_startTime = std::chrono::steady_clock::now();
 
     m_listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -296,6 +298,13 @@ void HttpServer::routeGet(int fd, const Request& req) {
         return;
     }
 
+    // GET /api/capture
+    if (req.path == "/api/capture") {
+        bool active = m_capturing ? m_capturing->load() : true;
+        sendJson(fd, 200, active ? "{\"active\":true}" : "{\"active\":false}");
+        return;
+    }
+
     // GET /api/status
     if (req.path == "/api/status") {
         sendJson(fd, 200, statusJson());
@@ -358,6 +367,19 @@ void HttpServer::routeGet(int fd, const Request& req) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void HttpServer::routePost(int fd, const Request& req) {
+
+    // POST /api/capture  — body: {"active": true/false}
+    if (req.path == "/api/capture") {
+        std::string val = jsonStringValue(req.body, "active");
+        // Also handle bare true/false (not quoted)
+        bool active = (val == "true") ||
+                      (req.body.find("\"active\":true")  != std::string::npos) ||
+                      (req.body.find("\"active\": true") != std::string::npos);
+        if (m_captureCb) m_captureCb(active);
+        printf("HttpServer: capture %s\n", active ? "started" : "stopped");
+        sendJson(fd, 200, active ? "{\"active\":true}" : "{\"active\":false}");
+        return;
+    }
 
     // POST /api/config/location  — body: {"lat":13.7563,"lon":100.5018}
     if (req.path == "/api/config/location") {
@@ -466,11 +488,14 @@ std::string HttpServer::statusJson() const {
     DetectionStats ds = m_db ? m_db->getStats() : DetectionStats{};
     double sizeMb = m_db ? static_cast<double>(m_db->fileSizeBytes()) / 1e6 : 0.0;
 
+    bool capturing = m_capturing ? m_capturing->load() : true;
+
     char buf[512];
     snprintf(buf, sizeof(buf),
         "{"
         "\"id\":%s,"
         "\"location\":%s,"
+        "\"capturing\":%s,"
         "\"uptime_s\":%lld,"
         "\"fps\":%.1f,"
         "\"detections\":%lld,"
@@ -480,6 +505,7 @@ std::string HttpServer::statusJson() const {
         "}",
         jsonStr(m_cfg.trapId).c_str(),
         jsonStr(m_cfg.trapLocation).c_str(),
+        capturing ? "true" : "false",
         (long long)uptime,
         fps,
         (long long)ds.totalDetections,

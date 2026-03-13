@@ -123,6 +123,10 @@ int main(int argc, char* argv[]) {
     // fps is updated by the main stats loop; the HTTP server reads it on demand.
     float currentFps = 0.f;
 
+    // Capture flag — true means inference/tracking/saving is active.
+    // The MJPEG stream always runs regardless of this flag.
+    std::atomic<bool> g_capturing{true};
+
     http.setLocationCallback([&](double lat, double lon) {
         cfg.gpsLat   = lat;
         cfg.gpsLon   = lon;
@@ -139,6 +143,11 @@ int main(int argc, char* argv[]) {
         DecoderConfig dc = decoder.config();
         dc.confThresh = thresh;
         decoder.setConfig(dc);
+    });
+
+    http.setCaptureCallback([&](bool active) {
+        g_capturing = active;
+        sse.pushEvent(TrapEvents::captureState(active));
     });
 
     // Populate EXIF template from TrapConfig (GPS, trapId, location)
@@ -172,7 +181,7 @@ int main(int argc, char* argv[]) {
     });
 
     try {
-        http.open(cfg.http, &db, &sse, &sync, &currentFps);
+        http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);
     } catch (const std::exception& e) {
         fprintf(stderr, "Fatal: cannot start HTTP server: %s\n", e.what());
         sse.close();
@@ -260,8 +269,14 @@ int main(int argc, char* argv[]) {
 
     cam.setCallback([&](const CaptureFrame& frame) {
 
-        lastAfState.store(frame.afState,    std::memory_order_relaxed);
+        lastAfState.store(frame.afState,      std::memory_order_relaxed);
         lastLensPos.store(frame.lensPosition, std::memory_order_relaxed);
+
+        // MJPEG stream always runs regardless of capture state
+        streamer.pushFrame(frame.nv12, frame.width, frame.height);
+
+        // Inference/tracking/saving only when capturing
+        if (!g_capturing.load(std::memory_order_relaxed)) return;
 
         // Inference
         ncnn::Extractor ex = net.create_extractor();
@@ -323,9 +338,6 @@ int main(int argc, char* argv[]) {
             if (!records.empty())
                 db.writeBatch(records);
         }
-
-        // Stream frame to MJPEG clients
-        streamer.pushFrame(frame.nv12, frame.width, frame.height);
 
         // Save best-confidence JPEG crop per confirmed track
         for (const auto& t : tracked) {
