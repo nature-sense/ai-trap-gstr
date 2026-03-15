@@ -88,11 +88,16 @@ public:
     void open(const CropSaverConfig& cfg);
 
     // Optional callback — fired on the worker thread after each JPEG is written.
-    // Arguments: trackId, classId, className, confidence, filepath, w, h
+    // Arguments: trackId, classId, className, confidence, filepath, w, h, timestampUs
     using SavedCallback = std::function<void(
         int trackId, int classId, const std::string& cls,
-        float conf, const std::string& path, int w, int h)>;
+        float conf, const std::string& path, int w, int h, int64_t timestampUs)>;
     void setSavedCallback(SavedCallback cb) { m_savedCb = std::move(cb); }
+
+    // Flush pending jobs, reset per-track state, and switch to a new output
+    // directory (created if absent).  Call this when a new capture session
+    // starts so crops are written into a session-specific subdirectory.
+    void startSession(const std::string& sessionDir);
 
     // Submit a detection for possible saving.
     // nv12      : compact (de-strided) NV12 buffer, frameWidth * frameHeight * 3/2 bytes

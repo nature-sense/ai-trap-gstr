@@ -29,17 +29,18 @@ void SyncManager::createSchema()
     // crops table — tracks every JPEG written by CropSaver
     execSql(R"(
         CREATE TABLE IF NOT EXISTS crops (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            file         TEXT    NOT NULL UNIQUE,   -- basename
-            path         TEXT    NOT NULL,           -- full path
-            track_id     INTEGER NOT NULL,
-            class_id     INTEGER NOT NULL DEFAULT 0,
-            label        TEXT    NOT NULL DEFAULT '',
-            confidence   REAL    NOT NULL DEFAULT 0,
-            timestamp_us INTEGER NOT NULL DEFAULT 0,
-            bytes        INTEGER NOT NULL DEFAULT 0,
-            synced       INTEGER NOT NULL DEFAULT 0, -- 0=new 1=acked 2=deleted
-            created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            file            TEXT    NOT NULL UNIQUE,   -- session-relative path, e.g. "20260314_153042/insect_42.jpg"
+            path            TEXT    NOT NULL,           -- full path on disk
+            track_id        INTEGER NOT NULL,
+            class_id        INTEGER NOT NULL DEFAULT 0,
+            label           TEXT    NOT NULL DEFAULT '',
+            confidence      REAL    NOT NULL DEFAULT 0,
+            timestamp_us    INTEGER NOT NULL DEFAULT 0,
+            bytes           INTEGER NOT NULL DEFAULT 0,
+            synced          INTEGER NOT NULL DEFAULT 0, -- 0=new 1=acked 2=deleted
+            capture_session TEXT    NOT NULL DEFAULT '',
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     )");
 
@@ -50,19 +51,34 @@ void SyncManager::createSchema()
 
     // Migration: if crops table existed without some columns, add them.
     // SQLite ALTER TABLE ADD COLUMN is safe to run on existing tables.
+    execSql("CREATE INDEX IF NOT EXISTS idx_crops_session "
+            "ON crops(capture_session)");
+
     const char* migrations[] = {
-        "ALTER TABLE crops ADD COLUMN class_id     INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE crops ADD COLUMN label        TEXT    NOT NULL DEFAULT ''",
-        "ALTER TABLE crops ADD COLUMN confidence   REAL    NOT NULL DEFAULT 0",
-        "ALTER TABLE crops ADD COLUMN timestamp_us INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE crops ADD COLUMN bytes        INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE crops ADD COLUMN synced       INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN class_id        INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN label           TEXT    NOT NULL DEFAULT ''",
+        "ALTER TABLE crops ADD COLUMN confidence      REAL    NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN timestamp_us    INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN bytes           INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN synced          INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE crops ADD COLUMN capture_session TEXT    NOT NULL DEFAULT ''",
         nullptr
     };
     for (int i = 0; migrations[i]; ++i) {
         // Ignore errors — column likely already exists
         sqlite3_exec(m_db, migrations[i], nullptr, nullptr, nullptr);
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Session tracking
+// ═════════════════════════════════════════════════════════════════════════════
+
+void SyncManager::setCurrentSession(const std::string& sessionId)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_currentSessionId = sessionId;
+    printf("SyncManager: current capture session = \"%s\"\n", sessionId.c_str());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -76,30 +92,36 @@ void SyncManager::registerCrop(const std::string& file,
                                 int64_t timestampUs,
                                 int64_t bytes)
 {
-    std::string path = m_cropsDir + "/" + file;
-
     std::lock_guard<std::mutex> lk(m_mutex);
     if (!m_db) return;
+
+    // Build session-relative file key: "<sessionId>/<basename>"
+    // Falls back to bare filename if no session is set.
+    std::string relFile = m_currentSessionId.empty()
+                          ? file
+                          : (m_currentSessionId + "/" + file);
+    std::string path = m_cropsDir + "/" + relFile;
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql =
         "INSERT OR IGNORE INTO crops "
-        "(file, path, track_id, class_id, label, confidence, timestamp_us, bytes, synced) "
-        "VALUES (?,?,?,?,?,?,?,?,0)";
+        "(file, path, track_id, class_id, label, confidence, timestamp_us, bytes, synced, capture_session) "
+        "VALUES (?,?,?,?,?,?,?,?,0,?)";
 
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         fprintf(stderr, "SyncManager: prepare registerCrop failed: %s\n",
                 sqlite3_errmsg(m_db));
         return;
     }
-    sqlite3_bind_text (stmt, 1, file.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text (stmt, 2, path.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int  (stmt, 3, trackId);
-    sqlite3_bind_int  (stmt, 4, classId);
-    sqlite3_bind_text (stmt, 5, label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (stmt, 1, relFile.c_str(),             -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (stmt, 2, path.c_str(),                -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (stmt, 3, trackId);
+    sqlite3_bind_int   (stmt, 4, classId);
+    sqlite3_bind_text  (stmt, 5, label.c_str(),               -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(stmt, 6, static_cast<double>(confidence));
-    sqlite3_bind_int64(stmt, 7, timestampUs);
-    sqlite3_bind_int64(stmt, 8, bytes);
+    sqlite3_bind_int64 (stmt, 7, timestampUs);
+    sqlite3_bind_int64 (stmt, 8, bytes);
+    sqlite3_bind_text  (stmt, 9, m_currentSessionId.c_str(),  -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -379,23 +401,25 @@ std::vector<CropRecord> SyncManager::queryPending() const
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(m_db,
         "SELECT id, file, path, track_id, class_id, label, "
-        "       confidence, timestamp_us, bytes, synced, created_at "
+        "       confidence, timestamp_us, bytes, synced, capture_session, created_at "
         "FROM crops WHERE synced=0 ORDER BY created_at ASC",
         -1, &stmt, nullptr);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CropRecord r;
-        r.id          = sqlite3_column_int64(stmt, 0);
-        r.file        = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        r.path        = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        r.trackId     = sqlite3_column_int  (stmt, 3);
-        r.classId     = sqlite3_column_int  (stmt, 4);
-        r.label       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        r.confidence  = static_cast<float>(sqlite3_column_double(stmt, 6));
-        r.timestampUs = sqlite3_column_int64(stmt, 7);
-        r.bytes       = sqlite3_column_int64(stmt, 8);
-        r.synced      = sqlite3_column_int  (stmt, 9);
-        r.createdAt   = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+        r.id             = sqlite3_column_int64(stmt, 0);
+        r.file           = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.path           = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        r.trackId        = sqlite3_column_int  (stmt, 3);
+        r.classId        = sqlite3_column_int  (stmt, 4);
+        r.label          = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        r.confidence     = static_cast<float>(sqlite3_column_double(stmt, 6));
+        r.timestampUs    = sqlite3_column_int64(stmt, 7);
+        r.bytes          = sqlite3_column_int64(stmt, 8);
+        r.synced         = sqlite3_column_int  (stmt, 9);
+        const auto* cs   = sqlite3_column_text (stmt, 10);
+        r.captureSession = cs ? reinterpret_cast<const char*>(cs) : "";
+        r.createdAt      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
         out.push_back(r);
     }
     sqlite3_finalize(stmt);

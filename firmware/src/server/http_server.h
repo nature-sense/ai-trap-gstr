@@ -60,11 +60,14 @@ public:
     using AfTriggerCb = std::function<void()>;
     // Called when the app starts/stops detection
     using CaptureCb   = std::function<void(bool active)>;
+    // Returns the current capture session ID (empty string if not capturing)
+    using SessionIdCb = std::function<std::string()>;
 
     void setLocationCallback (LocationCb  cb) { m_locationCb  = std::move(cb); }
     void setThresholdCallback(ThresholdCb cb) { m_thresholdCb = std::move(cb); }
     void setAfTriggerCallback(AfTriggerCb cb) { m_afTriggerCb = std::move(cb); }
     void setCaptureCallback  (CaptureCb   cb) { m_captureCb   = std::move(cb); }
+    void setSessionIdCallback(SessionIdCb cb) { m_sessionIdCb = std::move(cb); }
 
     // fps pointer is read on every /api/status request (updated by main loop)
     // capturing pointer reflects the current detection state
@@ -129,6 +132,7 @@ private:
     ThresholdCb      m_thresholdCb;
     AfTriggerCb      m_afTriggerCb;
     CaptureCb        m_captureCb;
+    SessionIdCb      m_sessionIdCb;
 
     const std::atomic<bool>* m_capturing = nullptr;
 

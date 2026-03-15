@@ -2,13 +2,13 @@
 #include "sse_server.h"
 #include "persistence.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -301,7 +301,13 @@ void HttpServer::routeGet(int fd, const Request& req) {
     // GET /api/capture
     if (req.path == "/api/capture") {
         bool active = m_capturing ? m_capturing->load() : true;
-        sendJson(fd, 200, active ? "{\"active\":true}" : "{\"active\":false}");
+        std::string sid = m_sessionIdCb ? m_sessionIdCb() : "";
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"active\":%s,\"sessionId\":%s}",
+                 active ? "true" : "false",
+                 sid.empty() ? "null" : jsonStr(sid).c_str());
+        sendJson(fd, 200, buf);
         return;
     }
 
@@ -332,16 +338,22 @@ void HttpServer::routeGet(int fd, const Request& req) {
         return;
     }
 
-    // GET /api/crops/<filename>  — serve JPEG
+    // GET /api/crops/<file>  — serve JPEG
+    // Supports flat filenames ("insect_42.jpg") and session-relative paths
+    // ("20260314_153042/insect_42.jpg") — exactly one subdirectory level allowed.
     if (req.path.substr(0, 11) == "/api/crops/") {
-        std::string filename = req.path.substr(11);
-        // Basic path traversal guard
-        if (filename.find('/') != std::string::npos ||
-            filename.find("..") != std::string::npos) {
+        std::string relPath = req.path.substr(11);
+        // Security: no '..' and at most one '/' (session subdir only)
+        if (relPath.find("..") != std::string::npos) {
             send404(fd);
             return;
         }
-        std::string fullPath = m_cfg.cropsDir + "/" + filename;
+        int slashes = static_cast<int>(std::count(relPath.begin(), relPath.end(), '/'));
+        if (slashes > 1) {
+            send404(fd);
+            return;
+        }
+        std::string fullPath = m_cfg.cropsDir + "/" + relPath;
         sendFile(fd, fullPath, "image/jpeg");
         return;
     }
@@ -489,13 +501,15 @@ std::string HttpServer::statusJson() const {
     double sizeMb = m_db ? static_cast<double>(m_db->fileSizeBytes()) / 1e6 : 0.0;
 
     bool capturing = m_capturing ? m_capturing->load() : true;
+    std::string sid = m_sessionIdCb ? m_sessionIdCb() : "";
 
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
         "{"
         "\"id\":%s,"
         "\"location\":%s,"
         "\"capturing\":%s,"
+        "\"sessionId\":%s,"
         "\"uptime_s\":%lld,"
         "\"fps\":%.1f,"
         "\"detections\":%lld,"
@@ -506,6 +520,7 @@ std::string HttpServer::statusJson() const {
         jsonStr(m_cfg.trapId).c_str(),
         jsonStr(m_cfg.trapLocation).c_str(),
         capturing ? "true" : "false",
+        sid.empty() ? "null" : jsonStr(sid).c_str(),
         (long long)uptime,
         fps,
         (long long)ds.totalDetections,
@@ -519,100 +534,44 @@ std::string HttpServer::cropsJson() const {
     std::string out = "[";
     bool first = true;
 
-    // If SyncManager (and hence the crops DB table) is available, join it
-    // so we can return trackId, confidence and timestampUs per file.
-    // Fall back to directory scan when sync is not wired up.
-    if (m_sync) {
-        sqlite3* db = m_sync ? nullptr : nullptr; // just use SQL directly
-        // Query crops table: only files that still exist on disk (synced != 2)
-        // We access the DB via a raw query through SyncManager's pending list,
-        // but for a read-only enriched list we query the DB directly via the
-        // SqliteWriter's rawDb().
-        // Simpler: enumerate directory and for each file query the crops table.
-        DIR* dir = opendir(m_cfg.cropsDir.c_str());
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir)) != nullptr) {
-                std::string name(ent->d_name);
-                if (name.size() < 5) continue;
-                if (name.substr(name.size() - 4) != ".jpg") continue;
+    // Query directly from the crops table (populated by SyncManager).
+    // Files marked synced=2 (deleted from disk) are excluded.
+    if (m_db) {
+        sqlite3* rawDb = m_db->rawDb();
+        sqlite3_stmt* s = nullptr;
+        const char* sql =
+            "SELECT file, bytes, track_id, label, confidence, timestamp_us, capture_session "
+            "FROM crops WHERE synced != 2 ORDER BY created_at DESC";
+        if (sqlite3_prepare_v2(rawDb, sql, -1, &s, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                const char* file    = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
+                int64_t     bytes   = sqlite3_column_int64 (s, 1);
+                int         trackId = sqlite3_column_int   (s, 2);
+                const char* label   = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
+                double      conf    = sqlite3_column_double(s, 4);
+                int64_t     tsUs    = sqlite3_column_int64 (s, 5);
+                const char* sess    = reinterpret_cast<const char*>(sqlite3_column_text(s, 6));
 
-                std::string path = m_cfg.cropsDir + "/" + name;
-                struct stat st{};
-                stat(path.c_str(), &st);
-
-                // Look up metadata from DB
-                int     trackId     = 0;
-                float   confidence  = 0.f;
-                int64_t timestampUs = 0;
-                std::string label;
-
-                if (m_db) {
-                    sqlite3* rawDb = m_db->rawDb();
-                    sqlite3_stmt* s = nullptr;
-                    if (sqlite3_prepare_v2(rawDb,
-                            "SELECT track_id, confidence, timestamp_us, label "
-                            "FROM crops WHERE file=? LIMIT 1",
-                            -1, &s, nullptr) == SQLITE_OK) {
-                        sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-                        if (sqlite3_step(s) == SQLITE_ROW) {
-                            trackId     = sqlite3_column_int   (s, 0);
-                            confidence  = static_cast<float>(
-                                          sqlite3_column_double(s, 1));
-                            timestampUs = sqlite3_column_int64 (s, 2);
-                            const char* lbl =
-                                reinterpret_cast<const char*>(
-                                    sqlite3_column_text(s, 3));
-                            if (lbl) label = lbl;
-                        }
-                        sqlite3_finalize(s);
-                    }
-                }
-
+                if (!file) continue;
                 if (!first) out += ',';
                 first = false;
-                char entry[512];
+
+                char entry[640];
                 snprintf(entry, sizeof(entry),
-                    "{\"file\":%s,\"bytes\":%lld,\"mtime\":%lld,"
+                    "{\"file\":%s,\"bytes\":%lld,"
                     "\"trackId\":%d,\"conf\":%.4f,"
-                    "\"timestampUs\":%lld,\"label\":\"%s\"}",
-                    jsonStr(name).c_str(),
-                    (long long)st.st_size,
-                    (long long)st.st_mtime,
+                    "\"timestampUs\":%lld,\"label\":\"%s\","
+                    "\"session\":\"%s\"}",
+                    jsonStr(std::string(file)).c_str(),
+                    (long long)bytes,
                     trackId,
-                    confidence,
-                    (long long)timestampUs,
-                    label.c_str());
+                    conf,
+                    (long long)tsUs,
+                    label ? label : "",
+                    sess  ? sess  : "");
                 out += entry;
             }
-            closedir(dir);
-        }
-    } else {
-        // No sync manager — plain directory scan, no DB metadata
-        DIR* dir = opendir(m_cfg.cropsDir.c_str());
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir)) != nullptr) {
-                std::string name(ent->d_name);
-                if (name.size() < 5) continue;
-                if (name.substr(name.size() - 4) != ".jpg") continue;
-
-                std::string path = m_cfg.cropsDir + "/" + name;
-                struct stat st{};
-                stat(path.c_str(), &st);
-
-                if (!first) out += ',';
-                first = false;
-                char entry[256];
-                snprintf(entry, sizeof(entry),
-                    "{\"file\":%s,\"bytes\":%lld,\"mtime\":%lld,"
-                    "\"trackId\":0,\"conf\":0,\"timestampUs\":0,\"label\":\"\"}",
-                    jsonStr(name).c_str(),
-                    (long long)st.st_size,
-                    (long long)st.st_mtime);
-                out += entry;
-            }
-            closedir(dir);
+            sqlite3_finalize(s);
         }
     }
     out += ']';

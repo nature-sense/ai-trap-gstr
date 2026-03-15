@@ -135,6 +135,23 @@ bool CropSaver::submit(const std::vector<uint8_t>& nv12,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  startSession()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void CropSaver::startSession(const std::string& sessionDir) {
+    flush();  // drain pending jobs written to the previous directory
+    {
+        std::lock_guard<std::mutex> lk(m_trackMutex);
+        m_tracks.clear();       // reset per-track best-confidence state
+        m_cfg.outputDir = sessionDir;
+    }
+    if (!mkdirP(sessionDir))
+        fprintf(stderr, "CropSaver: cannot create session dir: %s\n",
+                sessionDir.c_str());
+    printf("CropSaver: new session  dir=%s\n", sessionDir.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  flush() / close()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -193,7 +210,7 @@ void CropSaver::workerLoop() {
             if (m_savedCb) {
                 m_savedCb(job.trackId, job.classId, job.className,
                           job.confidence, job.outPath,
-                          job.cropW, job.cropH);
+                          job.cropW, job.cropH, job.timestampUs);
             }
         } else {
             m_cropsDropped++;

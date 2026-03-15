@@ -16,8 +16,11 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -35,6 +38,19 @@ static const char* className(int id) { return id == 0 ? CLASS_NAMES[0] : "?"; }
 static std::atomic<bool> g_stop{false};
 static std::atomic<int>  g_stopSignal{0};
 static void onSignal(int sig) { g_stopSignal = sig; g_stop = true; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Session ID helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string makeSessionId() {
+    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    struct tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_buf);
+    return buf;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  main
@@ -127,6 +143,26 @@ int main(int argc, char* argv[]) {
     // The MJPEG stream always runs regardless of this flag.
     std::atomic<bool> g_capturing{true};
 
+    // Current capture session ID (empty when not capturing).
+    // Protected by sessionMutex — written from the HTTP thread, read from
+    // the HTTP thread and the saved-crop callback.
+    std::string currentSessionId;
+    std::mutex  sessionMutex;
+
+    // Start a new capture session: picks a timestamped ID, creates the
+    // subdirectory, and notifies CropSaver and SyncManager.
+    auto startCaptureSession = [&]() {
+        std::string sid = makeSessionId();
+        std::string sessionDir = cfg.crops.outputDir + "/" + sid;
+        crops.startSession(sessionDir);
+        sync.setCurrentSession(sid);
+        {
+            std::lock_guard<std::mutex> lk(sessionMutex);
+            currentSessionId = sid;
+        }
+        printf("main: capture session started: %s\n", sid.c_str());
+    };
+
     http.setLocationCallback([&](double lat, double lon) {
         cfg.gpsLat   = lat;
         cfg.gpsLon   = lon;
@@ -146,7 +182,18 @@ int main(int argc, char* argv[]) {
     });
 
     http.setCaptureCallback([&](bool active) {
-        g_capturing = active;
+        if (active) {
+            startCaptureSession();
+            g_capturing = true;
+        } else {
+            g_capturing = false;
+            sync.setCurrentSession("");
+            {
+                std::lock_guard<std::mutex> lk(sessionMutex);
+                currentSessionId = "";
+            }
+            printf("main: capture session closed\n");
+        }
         sse.pushEvent(TrapEvents::captureState(active));
     });
 
@@ -164,20 +211,32 @@ int main(int argc, char* argv[]) {
     crops.setSavedCallback([&](int trackId, int classId,
                                   const std::string& cls,
                                   float conf, const std::string& path,
-                                  int w, int h) {
-        // Extract just the filename from the full path
+                                  int w, int h, int64_t timestampUs) {
+        // Extract just the filename (basename) from the full path for SSE
         std::string filename = path;
         auto slash = path.rfind('/');
         if (slash != std::string::npos) filename = path.substr(slash + 1);
 
         sse.pushEvent(TrapEvents::cropSaved(
             trackId, cls.c_str(), conf, filename.c_str(), w, h));
+
+        // Register in the DB so the sync API can serve it.
+        // File size is read from disk after the write has completed.
+        struct stat st{};
+        int64_t bytes = (::stat(path.c_str(), &st) == 0)
+                        ? static_cast<int64_t>(st.st_size) : 0;
+        sync.registerCrop(filename, trackId, classId, cls, conf, timestampUs, bytes);
     });
 
     http.setAfTriggerCallback([&]() {
         // Trigger a one-shot AF scan.  LibcameraCapture will pick this up
         // on the next call to applyControls() — add that method if needed.
         printf("AF trigger requested via API\n");
+    });
+
+    http.setSessionIdCallback([&]() -> std::string {
+        std::lock_guard<std::mutex> lk(sessionMutex);
+        return currentSessionId;
     });
 
     try {
@@ -190,6 +249,11 @@ int main(int argc, char* argv[]) {
         db.close();
         return 1;
     }
+
+    // ── Initial capture session ───────────────────────────────────────────────
+    // Capture starts as active on boot — create the first session now so
+    // crops are immediately written into a timestamped subdirectory.
+    startCaptureSession();
 
     // ── ncnn model ────────────────────────────────────────────────────────────
 

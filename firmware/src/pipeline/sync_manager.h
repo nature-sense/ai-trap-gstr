@@ -45,16 +45,17 @@
 // ── Crop record as stored in DB ───────────────────────────────────────────────
 
 struct CropRecord {
-    int64_t     id          = 0;
-    std::string file;           // basename, e.g. "insect_42.jpg"
-    std::string path;           // full path on disk
-    int         trackId     = 0;
-    int         classId     = 0;
+    int64_t     id             = 0;
+    std::string file;              // session-relative path, e.g. "20260314_153042/insect_42.jpg"
+    std::string path;              // full path on disk
+    int         trackId        = 0;
+    int         classId        = 0;
     std::string label;
-    float       confidence  = 0.f;
-    int64_t     timestampUs = 0;
-    int64_t     bytes       = 0;
-    int         synced      = 0; // 0=new  1=acked  2=deleted
+    float       confidence     = 0.f;
+    int64_t     timestampUs    = 0;
+    int64_t     bytes          = 0;
+    int         synced         = 0; // 0=new  1=acked  2=deleted
+    std::string captureSession;    // e.g. "20260314_153042"
     std::string createdAt;
 };
 
@@ -90,9 +91,19 @@ public:
     // Creates the crops table if absent. Migrates existing schema.
     void init(sqlite3* db, const std::string& cropsDir);
 
+    // ── Session tracking ──────────────────────────────────────────────────────
+
+    // Set the active capture session.  Subsequent registerCrop() calls will
+    // store crops under "<sessionId>/<file>" so each session's files are
+    // namespaced in the DB and on disk.  Call this when a new capture session
+    // starts (and again when it ends, with an empty string).
+    void setCurrentSession(const std::string& sessionId);
+
     // ── Called by CropSaver after each successful JPEG write ──────────────────
 
-    // Register a new crop file. Thread-safe.
+    // Register a new crop file (basename only, e.g. "insect_42.jpg").
+    // The active session set via setCurrentSession() is prepended to form the
+    // unique file key stored in the DB.  Thread-safe.
     void registerCrop(const std::string& file,
                       int trackId, int classId,
                       const std::string& label,
@@ -134,6 +145,7 @@ public:
 private:
     sqlite3*    m_db      = nullptr;
     std::string m_cropsDir;
+    std::string m_currentSessionId;
 
     mutable std::mutex m_mutex;
 
